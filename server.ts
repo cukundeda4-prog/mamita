@@ -24,6 +24,16 @@ db.exec(`
     avg_buy_price REAL DEFAULT 0,
     PRIMARY KEY (user_id, block_id)
   );
+  CREATE TABLE IF NOT EXISTS personal_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT,
+    block_name TEXT,
+    amount REAL,
+    is_win INTEGER,
+    entry_price REAL,
+    exit_price REAL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 // Market State
@@ -80,7 +90,8 @@ app.post("/api/login", (req, res) => {
     user = { id, username, balance: 100.0 };
   }
   const holdings = db.prepare("SELECT * FROM holdings WHERE user_id = ?").all(user.id);
-  res.json({ user, holdings });
+  const history = db.prepare("SELECT * FROM personal_trades WHERE user_id = ? ORDER BY timestamp DESC LIMIT 20").all(user.id);
+  res.json({ user, holdings, history });
 });
 
 app.post("/api/trade", (req, res) => {
@@ -150,6 +161,10 @@ app.post("/api/update-balance", (req, res) => {
   
   db.prepare("UPDATE users SET balance = balance + ? WHERE id = ?").run(amount, userId);
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
+
+  // Save to personal history
+  db.prepare("INSERT INTO personal_trades (user_id, block_name, amount, is_win, entry_price, exit_price) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(userId, blockName, tradeAmount, isWin ? 1 : 0, entryPrice, exitPrice);
 
   // Broadcast trade to activity feed
   const tradeEvent = JSON.stringify({

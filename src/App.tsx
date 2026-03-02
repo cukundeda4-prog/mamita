@@ -65,6 +65,7 @@ interface TradeEvent {
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [holdings, setHoldings] = useState<Holding[]>([]);
+  const [personalHistory, setPersonalHistory] = useState<any[]>([]);
   const [marketPrices, setMarketPrices] = useState<Block[]>([]);
   const [priceHistory, setPriceHistory] = useState<Record<string, { time: string, price: number }[]>>({});
   const [activityFeed, setActivityFeed] = useState<TradeEvent[]>([]);
@@ -73,7 +74,7 @@ export default function App() {
   const [selectedBlock, setSelectedBlock] = useState<Block | null>(null);
   const [tradeAmount, setTradeAmount] = useState(1);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'market' | 'portfolio'>('market');
+  const [activeTab, setActiveTab] = useState<'market' | 'portfolio' | 'history'>('market');
   const [advisorMessage, setAdvisorMessage] = useState<{ text: string, type: 'buy' | 'sell' } | null>(null);
   const [pendingTrade, setPendingTrade] = useState<{ blockId: string, entryPrice: number, amount: number, timeLeft: number } | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
@@ -93,29 +94,35 @@ export default function App() {
       if (!selectedBlock || !priceHistory[selectedBlock.id]) return;
       
       const history = priceHistory[selectedBlock.id];
-      if (history.length < 10) return;
+      if (history.length < 5) return; // Reduced from 10 to 5 for faster initial signals
 
       const prices = history.map(h => h.price);
       const minPrice = Math.min(...prices);
       const maxPrice = Math.max(...prices);
       const currentPrice = selectedBlock.price;
 
-      // If price is near the 10-tick low, it's a strong buy signal
-      const isAtLow = currentPrice <= minPrice * 1.01; // Within 1% of low
-      const isAtHigh = currentPrice >= maxPrice * 0.99; // Within 1% of high
+      // Relaxed conditions: Within 3% of low/high instead of 1%
+      const isAtLow = currentPrice <= minPrice * 1.03; 
+      const isAtHigh = currentPrice >= maxPrice * 0.97; 
 
       if (isAtLow) {
         setAdvisorMessage({ 
-          text: `Advisor: ${selectedBlock.name} is at a 10-tick LOW! High probability of a recovery. Start a 5s UP prediction now!`, 
+          text: `Advisor: ${selectedBlock.name} is near a recent LOW! Great time for an UP prediction.`, 
           type: 'buy' 
         });
         advisorSound.current?.play().catch(() => {});
       } else if (isAtHigh) {
         setAdvisorMessage({ 
-          text: `Advisor: ${selectedBlock.name} is at a 10-tick HIGH! It might drop soon. Avoid UP predictions for now.`, 
+          text: `Advisor: ${selectedBlock.name} is near a recent HIGH! High risk of a drop.`, 
           type: 'sell' 
         });
         advisorSound.current?.play().catch(() => {});
+      } else {
+        // Add a neutral message so the user knows it's working
+        setAdvisorMessage({
+          text: `Advisor: ${selectedBlock.name} is currently stable. Wait for a dip to enter.`,
+          type: 'sell' // Using sell color for neutral/caution
+        });
       }
       
       setTimeout(() => setAdvisorMessage(null), 12000);
@@ -149,6 +156,14 @@ export default function App() {
           })
         }).then(res => res.json()).then(data => {
           setUser(data.user);
+          // Refresh history
+          fetch(`/api/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: user.username }),
+          }).then(res => res.json()).then(data => {
+            setPersonalHistory(data.history);
+          });
           setPendingTrade(null);
         });
       }
@@ -193,6 +208,7 @@ export default function App() {
       const data = await res.json();
       setUser(data.user);
       setHoldings(data.holdings);
+      setPersonalHistory(data.history);
       localStorage.setItem('smp_username', username);
     } catch (err) {
       setError('Failed to login');
@@ -330,6 +346,16 @@ export default function App() {
               >
                 <Wallet className="w-4 h-4" />
                 Portfolio
+              </button>
+              <button
+                onClick={() => setActiveTab('history')}
+                className={cn(
+                  "px-6 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-2",
+                  activeTab === 'history' ? "bg-emerald-500 text-white shadow-lg" : "text-gray-400 hover:text-white"
+                )}
+              >
+                <History className="w-4 h-4" />
+                History
               </button>
             </div>
 
@@ -493,7 +519,7 @@ export default function App() {
                     ))}
                   </div>
                 </motion.div>
-              ) : (
+              ) : activeTab === 'portfolio' ? (
                 <motion.div
                   key="portfolio"
                   initial={{ opacity: 0, x: -20 }}
@@ -550,6 +576,65 @@ export default function App() {
                               </tr>
                             );
                           })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </motion.div>
+              ) : (
+                <motion.div
+                  key="history"
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: 20 }}
+                  className="space-y-4"
+                >
+                  {personalHistory.length === 0 ? (
+                    <div className="bg-[#1a1a1a] border border-white/5 rounded-2xl p-12 text-center">
+                      <div className="w-16 h-16 bg-white/5 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <History className="w-8 h-8 text-gray-600" />
+                      </div>
+                      <h3 className="text-xl font-bold mb-2">No trades yet</h3>
+                      <p className="text-gray-400">Your prediction history will appear here.</p>
+                    </div>
+                  ) : (
+                    <div className="bg-[#1a1a1a] border border-white/5 rounded-2xl overflow-hidden">
+                      <table className="w-full text-left">
+                        <thead>
+                          <tr className="border-b border-white/5 bg-white/2">
+                            <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-wider">Result</th>
+                            <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-wider">Block</th>
+                            <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-wider">Bet</th>
+                            <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-wider">Entry/Exit</th>
+                            <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-wider">Time</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-white/5">
+                          {personalHistory.map((trade) => (
+                            <tr key={trade.id} className="hover:bg-white/2 transition-colors">
+                              <td className="px-6 py-4">
+                                <span className={cn(
+                                  "px-2 py-1 rounded text-[10px] font-bold uppercase",
+                                  trade.is_win ? "bg-emerald-500/20 text-emerald-400" : "bg-rose-500/20 text-rose-400"
+                                )}>
+                                  {trade.is_win ? 'WIN' : 'LOSS'}
+                                </span>
+                              </td>
+                              <td className="px-6 py-4 font-medium">{trade.block_name}</td>
+                              <td className="px-6 py-4 font-mono">
+                                <div className="flex items-center gap-1">
+                                  <Diamond className="w-3 h-3 text-cyan-400" />
+                                  {trade.amount}
+                                </div>
+                              </td>
+                              <td className="px-6 py-4 font-mono text-xs text-gray-400">
+                                {trade.entry_price.toFixed(2)} → {trade.exit_price.toFixed(2)}
+                              </td>
+                              <td className="px-6 py-4 text-xs text-gray-500">
+                                {new Date(trade.timestamp).toLocaleTimeString()}
+                              </td>
+                            </tr>
+                          ))}
                         </tbody>
                       </table>
                     </div>
