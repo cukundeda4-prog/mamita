@@ -28,37 +28,45 @@ db.exec(`
 
 // Market State
 const blocks = [
-  { id: "grass", name: "Grass Block", price: 1.2, volatility: 0.05 },
-  { id: "stone", name: "Stone", price: 2.5, volatility: 0.03 },
-  { id: "oak_log", name: "Oak Log", price: 5.0, volatility: 0.08 },
-  { id: "iron_ore", name: "Iron Ore", price: 15.0, volatility: 0.12 },
-  { id: "gold_ore", name: "Gold Ore", price: 45.0, volatility: 0.15 },
-  { id: "diamond_ore", name: "Diamond Ore", price: 150.0, volatility: 0.20 },
-  { id: "ancient_debris", name: "Ancient Debris", price: 500.0, volatility: 0.25 },
-  { id: "obsidian", name: "Obsidian", price: 80.0, volatility: 0.10 },
-  { id: "cobblestone", name: "Cobblestone", price: 0.8, volatility: 0.02 },
-  { id: "dirt", name: "Dirt", price: 0.5, volatility: 0.01 },
+  { id: "iron", name: "Iron Ore", price: 15.0, volatility: 0.12 },
+  { id: "copper", name: "Copper Ore", price: 8.0, volatility: 0.10 },
+  { id: "diamond", name: "Diamond Ore", price: 150.0, volatility: 0.20 },
+  { id: "emerald", name: "Emerald Ore", price: 200.0, volatility: 0.18 },
 ];
 
 let marketPrices = blocks.map(b => ({ ...b, lastPrice: b.price, trend: 0 }));
+const priceHistory: Record<string, { time: string, price: number }[]> = {};
+blocks.forEach(b => {
+  priceHistory[b.id] = [{ time: new Date().toLocaleTimeString(), price: b.price }];
+});
 
 // Simulate Market
 setInterval(() => {
+  const timestamp = new Date().toLocaleTimeString();
   marketPrices = marketPrices.map(b => {
     const changePercent = (Math.random() - 0.5) * 2 * b.volatility;
     const newPrice = Math.max(0.1, b.price * (1 + changePercent));
     const trend = newPrice > b.price ? 1 : -1;
+    
+    // Update history
+    priceHistory[b.id].push({ time: timestamp, price: parseFloat(newPrice.toFixed(2)) });
+    if (priceHistory[b.id].length > 30) priceHistory[b.id].shift();
+
     return { ...b, lastPrice: b.price, price: parseFloat(newPrice.toFixed(2)), trend };
   });
 
   // Broadcast to all clients
-  const data = JSON.stringify({ type: "MARKET_UPDATE", prices: marketPrices });
+  const data = JSON.stringify({ type: "MARKET_UPDATE", prices: marketPrices, history: priceHistory });
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(data);
     }
   });
 }, 3000);
+
+wss.on("connection", (ws) => {
+  ws.send(JSON.stringify({ type: "MARKET_UPDATE", prices: marketPrices, history: priceHistory }));
+});
 
 app.use(express.json());
 
@@ -114,9 +122,54 @@ app.post("/api/trade", (req, res) => {
     db.prepare("UPDATE users SET balance = balance + ? WHERE id = ?").run(totalCost, userId);
   }
 
+  // Broadcast trade to activity feed
+  const tradeEvent = JSON.stringify({
+    type: "TRADE_EVENT",
+    event: {
+      username: user.username,
+      type,
+      blockName: block.name,
+      amount,
+      price: block.price,
+      time: new Date().toLocaleTimeString()
+    }
+  });
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(tradeEvent);
+    }
+  });
+
   const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
   const updatedHoldings = db.prepare("SELECT * FROM holdings WHERE user_id = ?").all(userId);
   res.json({ user: updatedUser, holdings: updatedHoldings });
+});
+
+app.post("/api/update-balance", (req, res) => {
+  const { userId, amount, isWin, blockName, tradeAmount, entryPrice, exitPrice } = req.body;
+  
+  db.prepare("UPDATE users SET balance = balance + ? WHERE id = ?").run(amount, userId);
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
+
+  // Broadcast trade to activity feed
+  const tradeEvent = JSON.stringify({
+    type: "TRADE_EVENT",
+    event: {
+      username: user.username,
+      type: isWin ? 'buy' : 'sell', // Use buy/sell for win/loss visualization
+      blockName: `${blockName} Prediction`,
+      amount: tradeAmount,
+      price: exitPrice,
+      time: new Date().toLocaleTimeString()
+    }
+  });
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(tradeEvent);
+    }
+  });
+
+  res.json({ user });
 });
 
 // Vite Middleware

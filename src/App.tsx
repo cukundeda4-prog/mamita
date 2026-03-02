@@ -11,10 +11,22 @@ import {
   Search,
   LayoutDashboard,
   User as UserIcon,
-  LogOut
+  LogOut,
+  Activity
 } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { 
+  LineChart, 
+  Line, 
+  XAxis, 
+  YAxis, 
+  CartesianGrid, 
+  Tooltip, 
+  ResponsiveContainer,
+  AreaChart,
+  Area
+} from 'recharts';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -41,17 +53,114 @@ interface Holding {
   avg_buy_price: number;
 }
 
+interface TradeEvent {
+  username: string;
+  type: 'buy' | 'sell';
+  blockName: string;
+  amount: number;
+  price: number;
+  time: string;
+}
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [holdings, setHoldings] = useState<Holding[]>([]);
   const [marketPrices, setMarketPrices] = useState<Block[]>([]);
+  const [priceHistory, setPriceHistory] = useState<Record<string, { time: string, price: number }[]>>({});
+  const [activityFeed, setActivityFeed] = useState<TradeEvent[]>([]);
   const [username, setUsername] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [selectedBlock, setSelectedBlock] = useState<Block | null>(null);
   const [tradeAmount, setTradeAmount] = useState(1);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'market' | 'portfolio'>('market');
+  const [advisorMessage, setAdvisorMessage] = useState<{ text: string, type: 'buy' | 'sell' } | null>(null);
+  const [pendingTrade, setPendingTrade] = useState<{ blockId: string, entryPrice: number, amount: number, timeLeft: number } | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
+  const advisorSound = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    advisorSound.current = new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3');
+  }, []);
+
+  useEffect(() => {
+    if (!selectedBlock) {
+      setAdvisorMessage(null);
+      return;
+    }
+
+    const interval = setInterval(() => {
+      if (!selectedBlock || !priceHistory[selectedBlock.id]) return;
+      
+      const history = priceHistory[selectedBlock.id];
+      if (history.length < 10) return;
+
+      const prices = history.map(h => h.price);
+      const minPrice = Math.min(...prices);
+      const maxPrice = Math.max(...prices);
+      const currentPrice = selectedBlock.price;
+
+      // If price is near the 10-tick low, it's a strong buy signal
+      const isAtLow = currentPrice <= minPrice * 1.01; // Within 1% of low
+      const isAtHigh = currentPrice >= maxPrice * 0.99; // Within 1% of high
+
+      if (isAtLow) {
+        setAdvisorMessage({ 
+          text: `Advisor: ${selectedBlock.name} is at a 10-tick LOW! High probability of a recovery. Start a 5s UP prediction now!`, 
+          type: 'buy' 
+        });
+        advisorSound.current?.play().catch(() => {});
+      } else if (isAtHigh) {
+        setAdvisorMessage({ 
+          text: `Advisor: ${selectedBlock.name} is at a 10-tick HIGH! It might drop soon. Avoid UP predictions for now.`, 
+          type: 'sell' 
+        });
+        advisorSound.current?.play().catch(() => {});
+      }
+      
+      setTimeout(() => setAdvisorMessage(null), 12000);
+    }, 15000);
+
+    return () => clearInterval(interval);
+  }, [selectedBlock?.id, selectedBlock?.price]);
+
+  // Handle Pending Trade Countdown
+  useEffect(() => {
+    if (!pendingTrade) return;
+
+    if (pendingTrade.timeLeft <= 0) {
+      const currentBlock = marketPrices.find(b => b.id === pendingTrade.blockId);
+      if (currentBlock && user) {
+        const isProfit = currentBlock.price > pendingTrade.entryPrice;
+        const resultAmount = isProfit ? pendingTrade.amount * 2 : 0;
+        
+        // Update balance on server
+        fetch('/api/update-balance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            userId: user.id, 
+            amount: resultAmount - pendingTrade.amount, // Net change
+            isWin: isProfit,
+            blockName: currentBlock.name,
+            tradeAmount: pendingTrade.amount,
+            entryPrice: pendingTrade.entryPrice,
+            exitPrice: currentBlock.price
+          })
+        }).then(res => res.json()).then(data => {
+          setUser(data.user);
+          setPendingTrade(null);
+        });
+      }
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setPendingTrade(prev => prev ? { ...prev, timeLeft: prev.timeLeft - 1 } : null);
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [pendingTrade?.timeLeft, marketPrices]);
 
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -62,6 +171,9 @@ export default function App() {
       const data = JSON.parse(event.data);
       if (data.type === 'MARKET_UPDATE') {
         setMarketPrices(data.prices);
+        setPriceHistory(data.history);
+      } else if (data.type === 'TRADE_EVENT') {
+        setActivityFeed(prev => [data.event, ...prev].slice(0, 10));
       }
     };
 
@@ -93,34 +205,23 @@ export default function App() {
     const savedUsername = localStorage.getItem('smp_username');
     if (savedUsername) {
       setUsername(savedUsername);
-      // Auto login could be triggered here
     }
   }, []);
 
-  const handleTrade = async (type: 'buy' | 'sell') => {
-    if (!user || !selectedBlock) return;
-    try {
-      const res = await fetch('/api/trade', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: user.id,
-          blockId: selectedBlock.id,
-          amount: tradeAmount,
-          type,
-        }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setUser(data.user);
-        setHoldings(data.holdings);
-        setError(null);
-      } else {
-        setError(data.error);
-      }
-    } catch (err) {
-      setError('Trade failed');
+  const handleTrade = async () => {
+    if (!user || !selectedBlock || pendingTrade) return;
+    if (user.balance < tradeAmount) {
+      setError('Insufficient diamonds');
+      return;
     }
+
+    setPendingTrade({
+      blockId: selectedBlock.id,
+      entryPrice: selectedBlock.price,
+      amount: tradeAmount,
+      timeLeft: 5
+    });
+    setError(null);
   };
 
   if (!user) {
@@ -135,7 +236,7 @@ export default function App() {
             <div className="w-16 h-16 bg-emerald-500 rounded-xl flex items-center justify-center mb-4 shadow-lg shadow-emerald-500/20">
               <Box className="w-10 h-10 text-white" />
             </div>
-            <h1 className="text-3xl font-bold tracking-tight">School SMP Stocks</h1>
+            <h1 className="text-3xl font-bold tracking-tight">Earth Stocks</h1>
             <p className="text-gray-400 mt-2">The ultimate block market</p>
           </div>
 
@@ -165,6 +266,8 @@ export default function App() {
     );
   }
 
+  const selectedHistory = selectedBlock ? priceHistory[selectedBlock.id] || [] : [];
+
   return (
     <div className="min-h-screen bg-[#0f0f0f] text-white font-sans selection:bg-emerald-500/30">
       {/* Navigation */}
@@ -174,7 +277,7 @@ export default function App() {
             <div className="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center">
               <Box className="w-5 h-5" />
             </div>
-            <span className="font-bold text-xl tracking-tight hidden sm:block">School SMP Stocks</span>
+            <span className="font-bold text-xl tracking-tight hidden sm:block">Earth Stocks</span>
           </div>
 
           <div className="flex items-center gap-6">
@@ -238,53 +341,157 @@ export default function App() {
                   initial={{ opacity: 0, x: -20 }}
                   animate={{ opacity: 1, x: 0 }}
                   exit={{ opacity: 0, x: 20 }}
-                  className="grid grid-cols-1 sm:grid-cols-2 gap-4"
+                  className="space-y-6"
                 >
-                  {marketPrices.map((block) => (
-                    <motion.div
-                      key={block.id}
-                      layoutId={block.id}
-                      onClick={() => setSelectedBlock(block)}
-                      className={cn(
-                        "p-4 rounded-2xl border transition-all cursor-pointer group",
-                        selectedBlock?.id === block.id 
-                          ? "bg-emerald-500/10 border-emerald-500/50 shadow-lg shadow-emerald-500/5" 
-                          : "bg-[#1a1a1a] border-white/5 hover:border-white/20"
-                      )}
-                    >
-                      <div className="flex justify-between items-start mb-4">
-                        <div className="flex items-center gap-3">
-                          <div className="w-10 h-10 bg-white/5 rounded-xl flex items-center justify-center group-hover:scale-110 transition-transform">
-                            <Box className="w-6 h-6 text-emerald-400" />
-                          </div>
-                          <div>
-                            <h3 className="font-bold">{block.name}</h3>
-                            <p className="text-xs text-gray-500 uppercase tracking-wider">BLOCK_ID: {block.id}</p>
-                          </div>
-                        </div>
+                  {/* Advisor Notification */}
+                  <AnimatePresence>
+                    {advisorMessage && (
+                      <motion.div
+                        initial={{ opacity: 0, y: -20, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.95 }}
+                        className={cn(
+                          "p-4 rounded-xl border flex items-center gap-3 mb-6 shadow-lg",
+                          advisorMessage.type === 'buy' 
+                            ? "bg-emerald-500/20 border-emerald-500/50 text-emerald-400" 
+                            : "bg-cyan-500/20 border-cyan-500/50 text-cyan-400"
+                        )}
+                      >
                         <div className={cn(
-                          "flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-bold",
-                          block.trend >= 0 ? "text-emerald-400 bg-emerald-400/10" : "text-rose-400 bg-rose-400/10"
+                          "w-10 h-10 rounded-lg flex items-center justify-center shrink-0",
+                          advisorMessage.type === 'buy' ? "bg-emerald-500" : "bg-cyan-500"
                         )}>
-                          {block.trend >= 0 ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
-                          {Math.abs(((block.price - block.lastPrice) / block.lastPrice) * 100).toFixed(2)}%
+                          <Activity className="w-6 h-6 text-white" />
                         </div>
-                      </div>
-                      <div className="flex justify-between items-end">
+                        <div className="flex-1">
+                          <p className="font-bold text-sm">Market Advisor</p>
+                          <p className="text-xs opacity-90">{advisorMessage.text}</p>
+                        </div>
+                        <button 
+                          onClick={() => setAdvisorMessage(null)}
+                          className="text-xs font-bold opacity-50 hover:opacity-100"
+                        >
+                          Dismiss
+                        </button>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+
+                  {/* Chart Section */}
+                  {selectedBlock && (
+                    <motion.div 
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="bg-[#1a1a1a] border border-white/10 rounded-2xl p-6 shadow-xl"
+                    >
+                      <div className="flex justify-between items-center mb-6">
                         <div>
-                          <p className="text-xs text-gray-400 mb-1">Current Price</p>
-                          <div className="flex items-center gap-1.5">
-                            <Diamond className="w-4 h-4 text-cyan-400" />
-                            <span className="text-xl font-mono font-bold">{block.price.toFixed(2)}</span>
-                          </div>
+                          <h2 className="text-2xl font-bold flex items-center gap-2">
+                            {selectedBlock.name} History
+                          </h2>
+                          <p className="text-sm text-gray-400">Real-time price tracking (Last 30 ticks)</p>
                         </div>
                         <div className="text-right">
-                          <p className="text-xs text-gray-400 mb-1">Volatility</p>
-                          <p className="text-sm font-medium text-gray-300">High</p>
+                          <div className="flex items-center gap-2 justify-end">
+                            <Diamond className="w-5 h-5 text-cyan-400" />
+                            <span className="text-3xl font-mono font-bold">{selectedBlock.price.toFixed(2)}</span>
+                          </div>
+                          <p className={cn(
+                            "text-sm font-bold",
+                            selectedBlock.trend >= 0 ? "text-emerald-400" : "text-rose-400"
+                          )}>
+                            {selectedBlock.trend >= 0 ? '+' : ''}{((selectedBlock.price - selectedBlock.lastPrice) / selectedBlock.lastPrice * 100).toFixed(2)}%
+                          </p>
                         </div>
                       </div>
+                      
+                      <div className="h-[300px] w-full">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <AreaChart data={selectedHistory}>
+                            <defs>
+                              <linearGradient id="colorPrice" x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="5%" stopColor="#10b981" stopOpacity={0.3}/>
+                                <stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
+                              </linearGradient>
+                            </defs>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#ffffff05" vertical={false} />
+                            <XAxis 
+                              dataKey="time" 
+                              stroke="#666" 
+                              fontSize={10} 
+                              tickLine={false} 
+                              axisLine={false}
+                              interval="preserveStartEnd"
+                            />
+                            <YAxis 
+                              stroke="#666" 
+                              fontSize={10} 
+                              tickLine={false} 
+                              axisLine={false}
+                              domain={['auto', 'auto']}
+                            />
+                            <Tooltip 
+                              contentStyle={{ backgroundColor: '#1a1a1a', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '12px' }}
+                              itemStyle={{ color: '#10b981' }}
+                            />
+                            <Area 
+                              type="monotone" 
+                              dataKey="price" 
+                              stroke="#10b981" 
+                              strokeWidth={3}
+                              fillOpacity={1} 
+                              fill="url(#colorPrice)" 
+                              animationDuration={300}
+                            />
+                          </AreaChart>
+                        </ResponsiveContainer>
+                      </div>
                     </motion.div>
-                  ))}
+                  )}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    {marketPrices.map((block) => (
+                      <motion.div
+                        key={block.id}
+                        layoutId={block.id}
+                        onClick={() => setSelectedBlock(block)}
+                        className={cn(
+                          "p-4 rounded-2xl border transition-all cursor-pointer group",
+                          selectedBlock?.id === block.id 
+                            ? "bg-emerald-500/10 border-emerald-500/50 shadow-lg shadow-emerald-500/5" 
+                            : "bg-[#1a1a1a] border-white/5 hover:border-white/20"
+                        )}
+                      >
+                        <div className="flex justify-between items-start mb-4">
+                          <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 bg-white/5 rounded-xl flex items-center justify-center group-hover:scale-110 transition-transform">
+                              <Box className="w-6 h-6 text-emerald-400" />
+                            </div>
+                            <div>
+                              <h3 className="font-bold">{block.name}</h3>
+                              <p className="text-xs text-gray-500 uppercase tracking-wider">BLOCK_ID: {block.id}</p>
+                            </div>
+                          </div>
+                          <div className={cn(
+                            "flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-bold",
+                            block.trend >= 0 ? "text-emerald-400 bg-emerald-400/10" : "text-rose-400 bg-rose-400/10"
+                          )}>
+                            {block.trend >= 0 ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
+                            {Math.abs(((block.price - block.lastPrice) / block.lastPrice) * 100).toFixed(2)}%
+                          </div>
+                        </div>
+                        <div className="flex justify-between items-end">
+                          <div>
+                            <p className="text-xs text-gray-400 mb-1">Current Price</p>
+                            <div className="flex items-center gap-1.5">
+                              <Diamond className="w-4 h-4 text-cyan-400" />
+                              <span className="text-xl font-mono font-bold">{block.price.toFixed(2)}</span>
+                            </div>
+                          </div>
+                        </div>
+                      </motion.div>
+                    ))}
+                  </div>
                 </motion.div>
               ) : (
                 <motion.div
@@ -352,8 +559,8 @@ export default function App() {
             </AnimatePresence>
           </div>
 
-          {/* Right Column: Trading Panel */}
-          <div className="lg:col-span-4">
+          {/* Right Column: Trading Panel & Activity */}
+          <div className="lg:col-span-4 space-y-6">
             <div className="sticky top-24 space-y-6">
               <div className="bg-[#1a1a1a] border border-white/10 rounded-2xl p-6 shadow-xl">
                 <h2 className="text-xl font-bold mb-6 flex items-center gap-2">
@@ -430,19 +637,26 @@ export default function App() {
                         </motion.p>
                       )}
 
-                      <div className="grid grid-cols-2 gap-4">
-                        <button
-                          onClick={() => handleTrade('buy')}
-                          className="bg-emerald-500 hover:bg-emerald-600 text-white font-bold py-4 rounded-xl transition-all shadow-lg shadow-emerald-500/20 active:scale-95"
-                        >
-                          Buy
-                        </button>
-                        <button
-                          onClick={() => handleTrade('sell')}
-                          className="bg-[#2a2a2a] hover:bg-[#333] border border-white/10 text-white font-bold py-4 rounded-xl transition-all active:scale-95"
-                        >
-                          Sell
-                        </button>
+                      <div className="grid grid-cols-1 gap-4">
+                        {pendingTrade ? (
+                          <div className="bg-cyan-500/20 border border-cyan-500/50 rounded-xl p-4 text-center">
+                            <p className="text-sm text-cyan-400 font-bold mb-1">Trade in Progress...</p>
+                            <div className="text-3xl font-mono font-bold text-white">
+                              {pendingTrade.timeLeft}s
+                            </div>
+                            <p className="text-[10px] text-gray-400 mt-1">
+                              Entry: {pendingTrade.entryPrice.toFixed(2)} | Target: &gt; {pendingTrade.entryPrice.toFixed(2)}
+                            </p>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={handleTrade}
+                            className="bg-emerald-500 hover:bg-emerald-600 text-white font-bold py-4 rounded-xl transition-all shadow-lg shadow-emerald-500/20 active:scale-95 flex flex-col items-center"
+                          >
+                            <span>Start 5s Prediction</span>
+                            <span className="text-[10px] opacity-80">Win 2x if price goes UP</span>
+                          </button>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -456,22 +670,41 @@ export default function App() {
                 )}
               </div>
 
-              {/* Market Stats */}
+              {/* Global Activity Feed */}
               <div className="bg-[#1a1a1a] border border-white/5 rounded-2xl p-6">
-                <h3 className="text-sm font-bold text-gray-400 uppercase tracking-widest mb-4">Market Status</h3>
-                <div className="space-y-4">
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm text-gray-300">Total Volume</span>
-                    <span className="text-sm font-mono font-bold">1.2M Diamonds</span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm text-gray-300">Active Traders</span>
-                    <span className="text-sm font-mono font-bold">156</span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm text-gray-300">Market Cap</span>
-                    <span className="text-sm font-mono font-bold text-emerald-400">Rising</span>
-                  </div>
+                <h3 className="text-sm font-bold text-gray-400 uppercase tracking-widest mb-4 flex items-center gap-2">
+                  <Activity className="w-4 h-4 text-emerald-500" />
+                  Global Activity
+                </h3>
+                <div className="space-y-4 max-h-[300px] overflow-y-auto pr-2 custom-scrollbar">
+                  {activityFeed.length === 0 ? (
+                    <p className="text-xs text-gray-600 text-center py-4 italic">Waiting for market activity...</p>
+                  ) : (
+                    activityFeed.map((event, i) => (
+                      <motion.div 
+                        key={i}
+                        initial={{ opacity: 0, x: 10 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        className="flex items-start gap-3 text-xs border-b border-white/5 pb-3 last:border-0"
+                      >
+                        <div className={cn(
+                          "w-2 h-2 rounded-full mt-1.5 shrink-0",
+                          event.type === 'buy' ? "bg-emerald-500" : "bg-rose-500"
+                        )} />
+                        <div className="flex-1">
+                          <p className="font-medium">
+                            <span className="text-white">{event.username}</span>
+                            <span className="text-gray-500"> {event.type === 'buy' ? 'bought' : 'sold'} </span>
+                            <span className="text-emerald-400">{event.amount} {event.blockName}</span>
+                          </p>
+                          <div className="flex justify-between mt-1 text-[10px] text-gray-600">
+                            <span>@ {event.price.toFixed(2)}</span>
+                            <span>{event.time}</span>
+                          </div>
+                        </div>
+                      </motion.div>
+                    ))
+                  )}
                 </div>
               </div>
             </div>
@@ -484,14 +717,9 @@ export default function App() {
         <div className="max-w-7xl mx-auto px-4 text-center">
           <div className="flex items-center justify-center gap-2 mb-4">
             <Box className="w-5 h-5 text-emerald-500" />
-            <span className="font-bold tracking-tight">School SMP Stocks</span>
+            <span className="font-bold tracking-tight">Earth Stocks</span>
           </div>
-          <p className="text-gray-500 text-sm">© 2026 School SMP Network. All rights reserved.</p>
-          <div className="flex justify-center gap-6 mt-6">
-            <a href="#" className="text-xs text-gray-600 hover:text-white transition-colors">Market Rules</a>
-            <a href="#" className="text-xs text-gray-600 hover:text-white transition-colors">Privacy Policy</a>
-            <a href="#" className="text-xs text-gray-600 hover:text-white transition-colors">Support</a>
-          </div>
+          <p className="text-gray-500 text-sm">© 2026 Earth Stocks Network. All rights reserved.</p>
         </div>
       </footer>
     </div>
